@@ -1,0 +1,50 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# YOLO11-IRSTD-Architecture-Improved with GCAI & DRG
+nc: 8 # 请根据你的实际类别数修改 (你说是8类，这里改为8)
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C3k2_EFE, [256, False, 0.25]] # 2-P3/8 (EFE浅层特征)
+  - [-1, 1, Conv, [256, 3, 2]] # 3
+  - [-1, 2, C3k2_EFE, [512, False, 0.25]] # 4-P4/16
+  - [-1, 1, Conv, [512, 3, 2]] # 5
+  - [-1, 2, C3k2_EFE, [1024, True]] # 6-P5/32
+
+  # 7. DRG 增强模块 (确保 block.py 里参数已设默认值)
+  - [-1, 1, DynamicResidualGroup, [1024]]
+
+  # 8. SPPF
+  - [-1, 1, SPPF, [1024, 5]]
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 9
+  - [[-1, 4], 1, Concat, [1]] # 10 (cat P4)
+  - [-1, 2, C3k2, [512, False]] # 11
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 12
+
+  # 13. GCAI 融合模块
+  # 接收 [2, -1] -> 即 [P3(Layer 2), 上一层的Upsample(Layer 12)]
+  - [[2, -1], 1, GCAI_Fusion, [256]]
+
+  - [-1, 2, C3k2, [256, False]] # 14 (P3输出 -> Detect索引14)
+
+  - [-1, 1, Conv, [256, 3, 2]] # 15
+  - [[-1, 11], 1, Concat, [1]] # 16 (cat P4 Head)
+  - [-1, 2, C3k2, [512, False]] # 17 (P4输出 -> Detect索引17)
+
+  - [-1, 1, Conv, [512, 3, 2]] # 18
+  - [[-1, 8], 1, Concat, [1]] # 19 (cat SPPF/P5)
+  - [-1, 2, C3k2, [1024, True]] # 20 (P5输出 -> Detect索引20)
+
+  # 21. Detect
+  # 来源必须是 [14, 17, 20]，对应上面标注的三个输出层
+  - [[14, 17, 20], 1, Detect, [nc]]
