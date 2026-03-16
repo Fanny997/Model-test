@@ -13,7 +13,6 @@ import torch.nn as nn
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.extra_modules.block import (
     GCAI_Fusion,
-    ADSF_Fusion,
     DynamicResidualGroup,
     MDTE_Conv,
 )
@@ -1555,12 +1554,6 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             # 增加缩放逻辑：将 YAML 里的配置缩放 (对应 n/s/m/l 不同模型)
             c2 = args[0]
             c2 = make_divisible(min(c2, max_channels) * width, 8)
-            args = [c1[0], c1[1], c2]
-
-        elif m is ADSF_Fusion:
-            c1 = [ch[x] for x in f]  # 获取来源层(浅层和深层)的通道数
-            c2 = args[0]  # 获取 YAML 中配置的输出通道数
-            c2 = make_divisible(min(c2, max_channels) * width, 8)  # 根据模型大小(n/s/m)自适应缩放通道
             args = [c1[0], c1[1], c2]
 
         elif m is DynamicResidualGroup:

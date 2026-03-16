@@ -3,7 +3,7 @@ warnings.filterwarnings('ignore')
 from ultralytics import YOLO
 
 if __name__ == '__main__':
-    model = YOLO('/home/Cug-Rs02/20251011/IRSTD-YOLO/runs/datasets/train/exp-DRG/weights/best.pt')
+    model = YOLO('/home/Cug-Rs02/20251011/IRSTD-YOLO/runs/datasets/train/exp-SDS/weights/best.pt')
     model.val(data='/home/Cug-Rs02/20251011/IRSTD-YOLO/datasets/config.yaml',
               # data='./datasets/InfraredUAV/infrareduav.yaml',
               split='val',
@@ -14,5 +14,5 @@ if __name__ == '__main__':
               iou=0.5,
               save_json=True, 
               project='runs/datasets/val',
-              name='exp-DRG',
+              name='exp-SDS',
               )

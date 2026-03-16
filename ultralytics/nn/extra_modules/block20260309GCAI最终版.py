@@ -1,12 +1,11 @@
 import torch
-import math
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 from ..modules.conv import Conv
 from ..modules.block import *
 
-__all__ = ['MDTE_Conv', 'GCAI_Fusion', 'RCSAB', 'DynamicResidualGroup', 'C3k2_EFE', 'SPDConv', 'Multibranch', 'ADSF_Fusion']
+__all__ = ['MDTE_Conv', 'GCAI_Fusion', 'RCSAB', 'DynamicResidualGroup', 'C3k2_EFE', 'SPDConv', 'Multibranch']
 
 
 # ================================================================
@@ -52,75 +51,7 @@ class GCAI_Fusion(nn.Module):
         return self.out_conv(fused)
 
 
-class ADSF(nn.Module):
-    def __init__(self, channel, m=-0.80, b=1, gamma=2):
-        super(ADSF, self).__init__()
-
-        self.w = torch.nn.Parameter(torch.FloatTensor([m]), requires_grad=True)
-        self.mix_block = nn.Sigmoid()
-
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        t = int(abs((math.log(channel, 2) + b) / gamma))
-        k = t if t % 2 else t + 1
-        self.conv1 = nn.Conv1d(1, 1, kernel_size=k, padding=int(k / 2), bias=False)
-        self.fc = nn.Conv2d(channel, channel, 1, padding=0, bias=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x1, x2):
-        ax1 = self.avg_pool(x1)
-        ax2 = self.avg_pool(x2)
-        ax1 = self.conv1(ax1.squeeze(-1).transpose(-1, -2)).transpose(-1, -2)  # (1, C, 1)
-        ax2 = self.fc(ax2).squeeze(-1).transpose(-1, -2)  # (1, C, 1)
-        out1 = torch.sum(torch.matmul(ax1, ax2), dim=1).unsqueeze(-1).unsqueeze(-1)  # (1, C, 1, 1)
-        out1 = self.sigmoid(out1)
-        out2 = torch.sum(torch.matmul(ax2.transpose(-1, -2), ax1.transpose(-1, -2)), dim=1).unsqueeze(-1).unsqueeze(-1)
-        out2 = self.sigmoid(out2)
-        mix_factor = self.mix_block(self.w)
-        out = out1 * mix_factor + out2 * (1 - mix_factor)
-        out = self.conv1(out.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
-        out = self.sigmoid(out)
-
-        return torch.cat([(x2 * out), x1], dim=1)
-
-
 # ================================================================
-# 更新版：为 YOLO 架构定制的 ADSF 包装器 (修复深浅层映射)
-# ================================================================
-class ADSF_Fusion(nn.Module):
-    """
-    将 YOLO 的 [深层特征, 浅层特征] 列表输入转化为 SDS-Net ADSF 所需的对齐输入。
-    """
-
-    def __init__(self, c1, c2, c_out):
-        super().__init__()
-        # 1. 统一通道数：ADSF 要求 x1 和 x2 通道数一致，我们将它们对齐到 c_out 的一半
-        self.align_channels = c_out // 2
-        self.conv_deep = nn.Conv2d(c1, self.align_channels, 1)
-        self.conv_shallow = nn.Conv2d(c2, self.align_channels, 1)
-
-        # 2. 实例化 SDS-Net 原生的 ADSF
-        self.adsf = ADSF(self.align_channels)
-
-        # 3. 融合后通道数恢复
-        self.out_conv = Conv(c_out, c_out, 3)  # 使用 Ultralytics 自带的 3x3 Conv
-
-    def forward(self, x):
-        # 在 YOLO 中，f=[-1, 4]，即 x[0]是深层上采样特征，x[1]是浅层主干特征
-        x_deep, x_shallow = x[0], x[1]
-
-        # 空间分辨率对齐 (YOLO 必须的步骤)
-        if x_deep.size(2) != x_shallow.size(2):
-            x_deep = F.interpolate(x_deep, size=x_shallow.shape[2:], mode='bilinear', align_corners=False)
-
-        # 通道对齐
-        deep_feat = self.conv_deep(x_deep)
-        shallow_feat = self.conv_shallow(x_shallow)
-
-        # 执行 ADSF 融合
-        # (依据 SDS-Net 源码：x1必须传入深层语义 deep_feat，x2必须传入浅层细节 shallow_feat)
-        fused = self.adsf(deep_feat, shallow_feat)
-
-        return self.out_conv(fused)
 # 2. RDIAN 核心模块移植: MDTE_Conv (多方向目标增强)
 #    替代原有的 SobelConv，使用可学习的多方向差分卷积
 # ================================================================

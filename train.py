@@ -7,7 +7,7 @@ if __name__ == '__main__':
     # model.load('runs/train/exp2/weights/last.pt') # loading pretrain weights
     # print(model)  # 打印模型结构，看各层输入输出通道数
     model.train(
-                data='/home/Cug-Rs02/20251011/IRSTD-YOLO/datasets/config.yaml',
+                data='/home/Cug-Rs02/20251011/IRSTD-YOLO/M3FD/config.yaml',
                 # data='./datasets/AntiUAV310/antiuav310.yaml',
                 cache=False,
                 imgsz=512,
@@ -23,6 +23,6 @@ if __name__ == '__main__':
                 patience=50,
                 # resume=True,
                 amp=False, # close amp
-                project='runs/datasets/train',
-                name='exp-MDTE',
+                project='runs/M3FD/train',
+                name='exp-SDS',
                 )
