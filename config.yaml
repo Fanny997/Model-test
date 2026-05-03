@@ -1,6 +1,7 @@
 #path: /home/Cug-Rs02/20251011/IRSTD-YOLO/datasets
-train: /home/Cug-Rs02/20251011/IRSTD-YOLO/datasets/images/train  # 训练集图像根目录（红外和可见光需在子目录）
-val: /home/Cug-Rs02/20251011/IRSTD-YOLO/datasets/images/val      # 验证集图像根目录
-test: /home/Cug-Rs02/20251011/IRSTD-YOLO/datasets/images/test
-nc: 8                       # 目标类别数量
-names: ['car', 'truck', 'tractor', 'camping_car', 'van', 'vehicle', 'pick_up', 'boat']
+train: /home/Cug-Rs02/20251011/IRSTD-YOLO/M3FD/images/train  # 训练集图像根目录（红外和可见光需在子目录）
+val: /home/Cug-Rs02/20251011/IRSTD-YOLO/M3FD/images/val      # 验证集图像根目录
+test: /home/Cug-Rs02/20251011/IRSTD-YOLO/M3FD/images/test
+nc: 6                       # 目标类别数量
+#names: ['car', 'truck', 'tractor', 'camping_car', 'van', 'vehicle', 'pick_up', 'boat']
+names: ['Bus', 'car', 'Lamp', 'Motorcycle', 'people', 'Truck']

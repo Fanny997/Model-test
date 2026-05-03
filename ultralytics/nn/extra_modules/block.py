@@ -6,190 +6,47 @@ import torch.nn.functional as F
 from ..modules.conv import Conv
 from ..modules.block import *
 
-__all__ = ['MDTE_Conv', 'GCAI_Fusion', 'RCSAB', 'DynamicResidualGroup', 'C3k2_EFE', 'SPDConv', 'Multibranch', 'ADSF_Fusion']
+__all__ = ['DSA', 'RCSAB', 'DynamicResidualGroup', 'C3k2_EFE', 'SPDConv', 'Multibranch']
 
-
-# ================================================================
-# 1. 兼容版 GCAI_Fusion (通用门控融合)
-#    注意：此模块并非 RDIAN 原生，而是通用的 Gated Attention Fusion，
-#    用于解决深浅层特征融合时的语义不平衡问题。
-# ================================================================
-class GCAI_Fusion(nn.Module):
-    def __init__(self, c_low, c_high, c_out):
-        super().__init__()
-        # 公共组件
-        self.conv_low = nn.Conv2d(c_low, c_out, 1)
-        self.conv_high = nn.Conv2d(c_high, c_out, 1)
-        self.out_conv = nn.Conv2d(c_out, c_out, 3, padding=1)
-
-        # === 新版本组件 (Code Current Version) ===
-        self.att_high = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c_out, c_out // 4, 1),
-            nn.ReLU(),
-            nn.Conv2d(c_out // 4, c_out, 1),
-            nn.Sigmoid()
-        )
-        self.att_spatial = nn.Sequential(
-            nn.Conv2d(c_out, 1, 7, padding=3),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        x_low, x_high = x
-        if x_low.size(2) != x_high.size(2):
-            x_high = F.interpolate(x_high, size=x_low.shape[2:], mode='bilinear', align_corners=False)
-
-        low_feat = self.conv_low(x_low)
-        high_feat = self.conv_high(x_high)
-
-        # --- 门控融合逻辑 ---
-        # 利用高层语义生成注意力权重，筛选低层细节
-        high_att = self.att_high(high_feat) * high_feat
-        high_att = self.att_spatial(high_att) * high_att
-        fused = low_feat + high_att
-
-        return self.out_conv(fused)
-
-
-class ADSF(nn.Module):
-    def __init__(self, channel, m=-0.80, b=1, gamma=2):
-        super(ADSF, self).__init__()
-
-        self.w = torch.nn.Parameter(torch.FloatTensor([m]), requires_grad=True)
-        self.mix_block = nn.Sigmoid()
-
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        t = int(abs((math.log(channel, 2) + b) / gamma))
-        k = t if t % 2 else t + 1
-        self.conv1 = nn.Conv1d(1, 1, kernel_size=k, padding=int(k / 2), bias=False)
-        self.fc = nn.Conv2d(channel, channel, 1, padding=0, bias=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x1, x2):
-        ax1 = self.avg_pool(x1)
-        ax2 = self.avg_pool(x2)
-        ax1 = self.conv1(ax1.squeeze(-1).transpose(-1, -2)).transpose(-1, -2)  # (1, C, 1)
-        ax2 = self.fc(ax2).squeeze(-1).transpose(-1, -2)  # (1, C, 1)
-        out1 = torch.sum(torch.matmul(ax1, ax2), dim=1).unsqueeze(-1).unsqueeze(-1)  # (1, C, 1, 1)
-        out1 = self.sigmoid(out1)
-        out2 = torch.sum(torch.matmul(ax2.transpose(-1, -2), ax1.transpose(-1, -2)), dim=1).unsqueeze(-1).unsqueeze(-1)
-        out2 = self.sigmoid(out2)
-        mix_factor = self.mix_block(self.w)
-        out = out1 * mix_factor + out2 * (1 - mix_factor)
-        out = self.conv1(out.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
-        out = self.sigmoid(out)
-
-        return torch.cat([(x2 * out), x1], dim=1)
-
-
-# ================================================================
-# 更新版：为 YOLO 架构定制的 ADSF 包装器 (修复深浅层映射)
-# ================================================================
-class ADSF_Fusion(nn.Module):
-    """
-    将 YOLO 的 [深层特征, 浅层特征] 列表输入转化为 SDS-Net ADSF 所需的对齐输入。
-    """
-
-    def __init__(self, c1, c2, c_out):
-        super().__init__()
-        # 1. 统一通道数：ADSF 要求 x1 和 x2 通道数一致，我们将它们对齐到 c_out 的一半
-        self.align_channels = c_out // 2
-        self.conv_deep = nn.Conv2d(c1, self.align_channels, 1)
-        self.conv_shallow = nn.Conv2d(c2, self.align_channels, 1)
-
-        # 2. 实例化 SDS-Net 原生的 ADSF
-        self.adsf = ADSF(self.align_channels)
-
-        # 3. 融合后通道数恢复
-        self.out_conv = Conv(c_out, c_out, 3)  # 使用 Ultralytics 自带的 3x3 Conv
-
-    def forward(self, x):
-        # 在 YOLO 中，f=[-1, 4]，即 x[0]是深层上采样特征，x[1]是浅层主干特征
-        x_deep, x_shallow = x[0], x[1]
-
-        # 空间分辨率对齐 (YOLO 必须的步骤)
-        if x_deep.size(2) != x_shallow.size(2):
-            x_deep = F.interpolate(x_deep, size=x_shallow.shape[2:], mode='bilinear', align_corners=False)
-
-        # 通道对齐
-        deep_feat = self.conv_deep(x_deep)
-        shallow_feat = self.conv_shallow(x_shallow)
-
-        # 执行 ADSF 融合
-        # (依据 SDS-Net 源码：x1必须传入深层语义 deep_feat，x2必须传入浅层细节 shallow_feat)
-        fused = self.adsf(deep_feat, shallow_feat)
-
-        return self.out_conv(fused)
-# 2. RDIAN 核心模块移植: MDTE_Conv (多方向目标增强)
-#    替代原有的 SobelConv，使用可学习的多方向差分卷积
-# ================================================================
-class MDTE_Conv(nn.Module):
-    """
-    RDIAN MDTE (Multidirection Target Enhancement) 思想的 YOLO 适配版。
-    相比 Sobel 的固定算子，MDTE 通过学习不同方向的梯度差异，
-    能更好地突出红外小目标并抑制背景噪声。
-    """
-
-    def __init__(self, in_channels):
-        super().__init__()
-        # 学习 4 个方向的梯度 (水平、垂直、45度、135度)
-        # groups=in_channels 保证了对每个通道独立计算梯度，类似 Depthwise Conv
-        self.conv_diff = nn.Conv2d(in_channels, in_channels * 4, kernel_size=3, padding=1, groups=in_channels)
-        self.fuse = nn.Conv2d(in_channels * 4, in_channels, 1)
-        self.bn = nn.BatchNorm2d(in_channels)
-        self.act = nn.ReLU()
-
-    def forward(self, x):
-        # 1. 计算多方向差分
-        diff = self.conv_diff(x)
-        # 2. 融合差分特征 (找到最显著的区域)
-        out = self.fuse(diff)
-        return self.act(self.bn(out))
-
-
-# ================================================================
-# 3. 改进版 EFE 模块 (集成 MDTE + DRG)
-#    核心改动：移除了 SobelConv，替换为 MDTE_Conv
-# ================================================================
-class EFE(nn.Module):
-    def __init__(self, inc, ouc) -> None:
-        super().__init__()
-        # --- 改进: 用 MDTE (方向增强) 替换 Sobel (固定梯度) ---
-        # 理由：Sobel 对噪声敏感；MDTE 能通过多方向差分抑制杂波
-        self.edge_branch = MDTE_Conv(inc)
-        # -----------------------------------------------------
-
-        self.conv_branch = Conv(inc, inc, 3)
-        self.conv1 = Conv(inc * 2, ouc, 1)
-        # DRG 模块保持不变，用于对融合后的特征进行深层语义精炼
-        self.drg = DynamicResidualGroup(conv=default_conv, n_feat=ouc, kernel_size=3, reduction=4, n_resblocks=2)
-
-    def forward(self, x):
-        # 1. 提取特征
-        x_edge = self.edge_branch(x)  # 这里的特征现在是“纯净的目标增强特征”
-        x_main = self.conv_branch(x)
-
-        # 2. 融合 (MDTE 提取的边缘特征 + 卷积提取的语义特征)
-        x_concat = torch.cat([x_main, x_edge], dim=1)
-
-        # 3. 降维融合
-        x_fused = self.conv1(x_concat)
-
-        # 4. DRG 增强
-        # DRG 放在这里是为了进一步精炼融合后的特征
-        # 残差连接 x_fused 保证梯度传播
-        out = self.drg(x_fused) + x_fused
-
-        return out
-
-
-# ================================================================
-# 4. 其他辅助模块 (保持不变或微调)
-# ================================================================
-
+# =======================================================
+# 1. 提前声明 default_conv，防止下面类找不到它报错
+# =======================================================
 def default_conv(in_channels, out_channels, kernel_size, bias=True):
-    return nn.Conv2d(in_channels, out_channels, kernel_size, padding=(kernel_size // 2), bias=bias)
+    return nn.Conv2d(
+        in_channels, out_channels, kernel_size,
+        padding=(kernel_size // 2), bias=bias)
+
+###################################################### C3k2-EFE start #########################################################################
+# =======================================================
+# M3FD 满血版注意力机制与残差组 (直接覆盖原有的这三个类)
+# =======================================================
+class DSA(nn.Module):
+    """动态空间与通道注意力 (大目标感知特化 7x7)"""
+
+    def __init__(self, channel, reduction=16):
+        super(DSA, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+        self.spatial_conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid_spatial = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y_c = self.avg_pool(x).view(b, c)
+        y_c = self.fc(y_c).view(b, c, 1, 1)
+        x_c = x * y_c.expand_as(x)
+
+        avg_out = torch.mean(x_c, dim=1, keepdim=True)
+        max_out, _ = torch.max(x_c, dim=1, keepdim=True)
+        y_s = torch.cat([avg_out, max_out], dim=1)
+        y_s = self.sigmoid_spatial(self.spatial_conv(y_s))
+
+        return x_c * y_s
 
 
 class RCSAB(nn.Module):
@@ -201,20 +58,25 @@ class RCSAB(nn.Module):
             if bn: modules_body.append(nn.BatchNorm2d(n_feat))
             if i == 0: modules_body.append(act)
         self.body = nn.Sequential(*modules_body)
+
+        # 【核心修复】：直接传 n_feat！再也没有烦人的 in_channels 报错了
+        self.dsa = DSA(n_feat)
         self.res_scale = res_scale
 
     def forward(self, x):
         res = self.body(x)
+        res = self.dsa(res)
         res += x
         return res
 
 
 class DynamicResidualGroup(nn.Module):
-    def __init__(self, n_feat, kernel_size=3, reduction=4, n_resblocks=2, conv=default_conv):
+    def __init__(self, n_feat, conv=default_conv, kernel_size=3, reduction=4, n_resblocks=2):
         super(DynamicResidualGroup, self).__init__()
         modules_body = [
-            RCSAB(conv, n_feat, kernel_size, reduction, bias=True, bn=True,
-                  act=nn.LeakyReLU(negative_slope=0.2, inplace=True), res_scale=1) \
+            RCSAB(
+                conv, n_feat, kernel_size, reduction, bias=True, bn=True,
+                act=nn.LeakyReLU(negative_slope=0.2, inplace=True), res_scale=1) \
             for _ in range(n_resblocks)]
         modules_body.append(conv(n_feat, n_feat, kernel_size))
         self.body = nn.Sequential(*modules_body)
@@ -223,23 +85,53 @@ class DynamicResidualGroup(nn.Module):
         res = self.body(x)
         res += x
         return res
+# ================================================================
+# 恢复：MDTE_Conv (多方向目标增强边缘提取) - 专治 M3FD 复杂背景
+# ================================================================
+class MDTE_Conv(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        # 使用 4 个方向的可学习差分卷积 (利用 groups 实现独立通道处理，极轻量)
+        self.dir_conv = nn.Conv2d(c, c * 4, kernel_size=3, padding=1, groups=c, bias=False)
+        self.fuse = nn.Conv2d(c * 4, c, kernel_size=1)
+        self.act = nn.GELU()  # 使用 GELU 平滑特征
 
+    def forward(self, x):
+        # 提取多方向软响应并融合，过滤各向异性的背景干扰
+        out = self.act(self.dir_conv(x))
+        return self.fuse(out)
 
+class EFE(nn.Module):
+    def __init__(self, inc, ouc) -> None:
+        super().__init__()
+        # 【换回 MDTE】
+        self.edge_branch = MDTE_Conv(inc)
+        self.conv_branch = Conv(inc, inc, 3)
+        self.conv1 = Conv(inc * 2, ouc, 1)
+        self.drg = DynamicResidualGroup(n_feat=ouc, conv=default_conv, kernel_size=3, reduction=4, n_resblocks=2)
+
+    def forward(self, x):
+        x_edge = self.edge_branch(x)
+        x_main = self.conv_branch(x)
+        x_concat = torch.cat([x_main, x_edge], dim=1)
+        x_fused = self.conv1(x_concat)
+        out = self.drg(x_fused) + x_fused
+        return out
 class C3k_EFE(C3k):
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=3):
         super().__init__(c1, c2, n, shortcut, g, e, k)
         c_ = int(c2 * e)
-        # 这里调用的 EFE 现在已经是集成 MDTE 的新版本了
         self.m = nn.Sequential(*(EFE(c_, c_) for _ in range(n)))
-
 
 class C3k2_EFE(C3k2):
     def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
         super().__init__(c1, c2, n, c3k, e, g, shortcut)
         self.m = nn.ModuleList(
             C3k_EFE(self.c, self.c, 2, shortcut, g) if c3k else EFE(self.c, self.c) for _ in range(n))
+###################################################### C3k2-EFE end #########################################################################
 
 
+###################################################### IRSTE start #########################################################################
 class SPDConv(nn.Module):
     def __init__(self, inc, ouc, dimension=1):
         super().__init__()
@@ -250,6 +142,7 @@ class SPDConv(nn.Module):
         x = torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1)
         x = self.conv(x)
         return x
+
 class FGM(nn.Module):
     def __init__(self, dim) -> None:
         super().__init__()
@@ -269,13 +162,15 @@ class FGM(nn.Module):
         out = torch.abs(out)
         return out * self.alpha + x * self.beta
 
-
 class OmniKernel(nn.Module):
     def __init__(self, dim) -> None:
         super().__init__()
         ker = 31
         pad = ker // 2
-        self.in_conv = nn.Sequential(nn.Conv2d(dim, dim, kernel_size=1, padding=0, stride=1), nn.GELU())
+        self.in_conv = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=1, padding=0, stride=1),
+            nn.GELU()
+        )
         self.out_conv = nn.Conv2d(dim, dim, kernel_size=1, padding=0, stride=1)
         self.dw_13 = nn.Conv2d(dim, dim, kernel_size=(1, ker), padding=(0, pad), stride=1, groups=dim)
         self.dw_31 = nn.Conv2d(dim, dim, kernel_size=(ker, 1), padding=(pad, 0), stride=1, groups=dim)
@@ -302,22 +197,15 @@ class OmniKernel(nn.Module):
         out = self.act(out)
         return self.out_conv(out)
 
-
-
 class Multibranch(nn.Module):
     def __init__(self, dim, e=0.25):
         super().__init__()
         self.e = e
         self.cv1 = Conv(dim, dim, 1)
         self.cv2 = Conv(dim, dim, 1)
-        # OmniKernel 暂时移除或简化，如果需要可加回，但为了保持简洁聚焦 MDTE，此处略去
-        # 按照用户之前的代码，Multibranch 似乎调用了 OmniKernel，如果你的原始代码有 OmniKernel
-        # 请确保它也被定义。为了防止报错，我保留一个简单的占位或原逻辑。
-        # 假设 OmniKernel 在原文件中存在，这里省略其详细实现以聚焦 EFE 修改
-        self.m = nn.Identity()  # Placeholder provided as previous file content was cut off or context limited.
-        # User note: Ensure OmniKernel is present if used here. Based on provided snippet, it was present.
+        self.m = OmniKernel(int(dim * self.e))
 
     def forward(self, x):
-        # 这里的实现依赖于 OmniKernel，请确保该类存在于文件中
-        # 为保证代码完整性，建议保留你原始文件中的 OmniKernel 类
-        pass
+        ok_branch, identity = torch.split(self.cv1(x), [int(x.size(1) * self.e), int(x.size(1) * (1 - self.e))], dim=1)
+        return self.cv2(torch.cat((self.m(ok_branch), identity), 1))
+###################################################### IRSTE end #########################################################################

@@ -14,7 +14,7 @@ if __name__ == '__main__':
                 epochs=300,
                 # epochs=50,
                 batch=8,
-                mosaic=0.0,  # 【核心】关闭马赛克
+                mosaic=1.0,  # 【核心】关闭马赛克
                 mixup=0.1,
                 close_mosaic=0,
                 workers=4,
@@ -24,5 +24,5 @@ if __name__ == '__main__':
                 # resume=True,
                 amp=False, # close amp
                 project='runs/M3FD/train',
-                name='exp-SDS',
+                name='exp-ceshi',
                 )
