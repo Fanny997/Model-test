@@ -1,5 +1,6 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
-# Ablation Study: YOLO11 + EFE(with MDTE) + Standard Concat Head (NO GCAI)
+# M3FD 数据集最优架构: MDTE_Conv + DRG + Concat (无GCAI)
+
 nc: 8
 scales:
   n: [0.50, 0.25, 1024]
@@ -9,42 +10,44 @@ scales:
   x: [1.00, 1.50, 512]
 
 backbone:
-  # [from, repeats, module, args]
-  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
-  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 1, Conv, [128, 3, 2]]
 
-  # Layer 2: EFE 模块 (内部已集成 MDTE_Conv，替换了 Sobel)
-  - [-1, 2, C3k2_EFE, [256, False, 0.25]] # 2-P2/4
+  # 【核心保留】源头杂波清洗
+  - [-1, 2, MDTE_Conv, [256]]
+  - [-1, 1, Conv, [256, 3, 2]]
 
-  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
-  - [-1, 2, C3k2_EFE, [512, False, 0.25]] # 4-P3/8
+  - [-1, 2, C3k2_EFE, [512, False, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]]
 
-  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
-  - [-1, 2, C3k2_EFE, [1024, True]] # 6-P4/16
-  - [-1, 1, DynamicResidualGroup, [1024]] # 7-P4/16 (DRG)
-  - [-1, 1, SPPF, [1024, 5]] # 8-P4/16
+  - [-1, 2, C3k2_EFE, [1024, True]]
+  - [-1, 1, Conv, [1024, 3, 2]]
+
+  # 【绝对核心】M3FD跑出0.8+的DRG
+  - [-1, 1, DynamicResidualGroup, [1024]]
+
+  - [-1, 2, C3k2_EFE, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5]]
 
 head:
-  # === 上采样路径 (FPN) ===
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 9
-  - [[-1, 4], 1, Concat, [1]] # 10 (cat P3)
-  - [-1, 2, C3k2, [512, False]] # 11
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
 
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 12
+  # 摒弃GCAI，回归最稳健的Concat拼接
+  - [[-1, 6], 1, Concat, [1]]       # 12
+  - [-1, 2, C3k2_EFE, [512, False]] # 13
 
-  # === 消融实验关键点：这里不使用 GCAI，而是标准的 Concat ===
-  # [-1] 是当前上采样特征, [2] 是 Backbone P2 (含 MDTE 的 EFE 输出)
-  - [[-1, 2], 1, Concat, [1]] # 13 (标准 Concat)
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
 
-  - [-1, 2, C3k2, [256, False]] # 14
+  # 摒弃GCAI，回归最稳健的Concat拼接
+  - [[-1, 4], 1, Concat, [1]]       # 15
+  - [-1, 2, C3k2_EFE, [256, False]] # 16
 
-  # === 下采样路径 (PAN) ===
-  - [-1, 1, Conv, [256, 3, 2]] # 15
-  - [[-1, 11], 1, Concat, [1]] # 16
-  - [-1, 2, C3k2, [512, False]] # 17
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]]
+  - [-1, 2, C3k2_EFE, [512, False]]
 
-  - [-1, 1, Conv, [512, 3, 2]] # 18
-  - [[-1, 8], 1, Concat, [1]] # 19
-  - [-1, 2, C3k2, [1024, False]] # 20
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]]
+  - [-1, 2, C3k2_EFE, [1024, True]]
 
-  - [[14, 17, 20], 1, Detect, [nc]] # 21
+  - [[16, 19, 22], 1, Detect, [nc]]

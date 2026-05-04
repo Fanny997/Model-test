@@ -5,72 +5,34 @@ import torch.nn.functional as F
 from ..modules.conv import Conv
 from ..modules.block import *
 
-__all__ = ['MDTE_Simplified', 'GCAI_Fusion', 'RCSAB', 'DynamicResidualGroup', 'C3k2_EFE', 'SPDConv', 'Multibranch']
+__all__ = [
+    'GCAI_Fusion', 'RCSAB', 'DynamicResidualGroup', 'C3k2_EFE', 'C3k_EFE',
+    'MDTE_Conv', 'SPDConv', 'Multibranch', 'SobelConv', 'EFE', 'DynamicSpatialAttention'
+]
 
-
-# ================================================================
-# 1. 兼容版 GCAI_Fusion (能同时跑 RDIAN2/4 的旧模型 和 RDIAN3 的新模型)
-# ================================================================
 class GCAI_Fusion(nn.Module):
     def __init__(self, c_low, c_high, c_out):
         super().__init__()
-        # 公共组件
-        self.conv_low = nn.Conv2d(c_low, c_out, 1)
-        self.conv_high = nn.Conv2d(c_high, c_out, 1)
-        self.out_conv = nn.Conv2d(c_out, c_out, 3, padding=1)
+        self.align_high = Conv(c_high, c_low, 1) if c_high != c_low else nn.Identity()
 
-        # === 新版本组件 (Code Current Version) ===
-        self.att_high = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c_out, c_out // 4, 1),
-            nn.ReLU(),
-            nn.Conv2d(c_out // 4, c_out, 1),
+        self.mask_gen = nn.Sequential(
+            Conv(c_low * 2, c_low, 1),
+            nn.Conv2d(c_low, c_low, 1),
             nn.Sigmoid()
         )
-        self.att_spatial = nn.Sequential(
-            nn.Conv2d(c_out, 1, 7, padding=3),
-            nn.Sigmoid()
-        )
+        self.out_conv = Conv(c_low, c_out, 3)
 
-        # === 旧版本组件 (Legacy Support) ===
-        # 注意：这里定义是为了结构完整，实际加载旧权重时，这些层会直接从文件中恢复
-        self.att_conv = nn.Sequential(
-            nn.Conv2d(c_out * 2, c_out // 2, 1),
-            nn.BatchNorm2d(c_out // 2),
-            nn.ReLU(),
-            nn.Conv2d(c_out // 2, c_out, 1),
-            nn.Sigmoid()
-        )
+    def forward(self, x_low, x_high):
+        x_high_up = F.interpolate(x_high, size=x_low.shape[2:], mode='nearest')
+        x_high_aligned = self.align_high(x_high_up)
 
-    def forward(self, x):
-        x_low, x_high = x
-        if x_low.size(2) != x_high.size(2):
-            x_high = F.interpolate(x_high, size=x_low.shape[2:], mode='bilinear', align_corners=False)
+        w = self.mask_gen(torch.cat([x_low, x_high_aligned], dim=1))
+        gated_feat = x_low * w + x_high_aligned * (1 - w)
 
-        low_feat = self.conv_low(x_low)
-        high_feat = self.conv_high(x_high)
-
-        # 【核心修复逻辑】自动检测权重版本
-        if hasattr(self, 'att_high'):
-            # --- 新版本逻辑 (RDIAN3) ---
-            high_att = self.att_high(high_feat) * high_feat
-            high_att = self.att_spatial(high_att) * high_att
-            fused = low_feat + high_att
-        elif hasattr(self, 'att_conv'):
-            # --- 旧版本逻辑 (RDIAN2/4) ---
-            concat_feat = torch.cat([low_feat, high_feat], dim=1)
-            attention_map = self.att_conv(concat_feat)
-            fused = low_feat * attention_map + high_feat * (1 - attention_map)
-        else:
-            # 兜底逻辑 (直接相加)
-            fused = low_feat + high_feat
-
+        # 恒等残差注入，防止梯度截断
+        fused = x_low + gated_feat
         return self.out_conv(fused)
 
-
-# ================================================================
-# 2. 兼容版 DynamicSpatialAttention (之前修好的那个)
-# ================================================================
 class DynamicSpatialAttention(nn.Module):
     def __init__(self, n_feat, reduction=4, k_size=7):
         super(DynamicSpatialAttention, self).__init__()
@@ -140,77 +102,95 @@ class DynamicSpatialAttention(nn.Module):
             x = x * scale
         return x
 
-
-# ================================================================
-# 3. 其他模块 (保持不变)
-# ================================================================
-
-class MDTE_Simplified(nn.Module):
-    def __init__(self, channels):
+class MDTE_Conv(nn.Module):
+    """
+    采用多方向局部差分先验，替代死板的 Sobel，实现动态源头清洗
+    """
+    def __init__(self, c1, c2, k=3):
         super().__init__()
-        self.direction_conv = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
-        self.sigmoid = nn.Sigmoid()
+        self.conv = Conv(c1, c2, k, p=k//2)
+        self.dir_att = nn.Sequential(
+            nn.Conv2d(c1, c1, kernel_size=3, padding=1, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        diff = self.direction_conv(x)
-        att = self.sigmoid(diff)
-        return x * att + x
-
+        # 物理先验：目标是局部极值点。利用差分突出目标，并用注意力掩码过滤杂波
+        local_diff = x - F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        return self.conv(x * self.dir_att(local_diff))
 
 def default_conv(in_channels, out_channels, kernel_size, bias=True):
     return nn.Conv2d(in_channels, out_channels, kernel_size, padding=(kernel_size // 2), bias=bias)
 
-
 class RCSAB(nn.Module):
-    def __init__(self, conv, n_feat, kernel_size, reduction, bias=True, bn=False, act=nn.ReLU(True), res_scale=1):
+    def __init__(self, in_channels):
         super(RCSAB, self).__init__()
-        modules_body = []
-        for i in range(2):
-            modules_body.append(conv(n_feat, n_feat, kernel_size, bias=bias))
-            if bn: modules_body.append(nn.BatchNorm2d(n_feat))
-            if i == 0: modules_body.append(act)
-        self.body = nn.Sequential(*modules_body)
-        self.res_scale = res_scale
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(in_channels)
+
+        self.ca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, in_channels // 4, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 4, in_channels, 1, bias=False),
+            nn.Sigmoid()
+        )
+        self.sa = nn.Sequential(
+            nn.Conv2d(in_channels, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        res = self.body(x)
-        res += x
-        return res
-
+        residual = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out * self.ca(out)
+        out = out * self.sa(out)
+        out += residual
+        return self.relu(out)
 
 class DynamicResidualGroup(nn.Module):
-    def __init__(self, n_feat, kernel_size=3, reduction=4, n_resblocks=2, conv=default_conv):
+    def __init__(self, c1, c2=None, num_blocks=2):
         super(DynamicResidualGroup, self).__init__()
-        modules_body = [
-            RCSAB(conv, n_feat, kernel_size, reduction, bias=True, bn=True,
-                  act=nn.LeakyReLU(negative_slope=0.2, inplace=True), res_scale=1) \
-            for _ in range(n_resblocks)]
-        modules_body.append(conv(n_feat, n_feat, kernel_size))
-        self.body = nn.Sequential(*modules_body)
+        c2 = c2 or c1
+        self.reduce_conv = Conv(c1, c2, 1) if c1 != c2 else nn.Identity()
+        self.blocks = nn.Sequential(*[RCSAB(c2) for _ in range(num_blocks)])
+        self.conv_out = Conv(c2, c2, 3)
 
     def forward(self, x):
-        res = self.body(x)
-        res += x
-        return res
-
+        x = self.reduce_conv(x)
+        residual = x
+        out = self.blocks(x)
+        out = self.conv_out(out)
+        out += residual
+        return out
 
 class SobelConv(nn.Module):
     def __init__(self, channel) -> None:
         super().__init__()
-        sobel = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]])
-        sobel_kernel_y = torch.tensor(sobel, dtype=torch.float32).unsqueeze(0).expand(channel, 1, 1, 3, 3)
-        sobel_kernel_x = torch.tensor(sobel.T, dtype=torch.float32).unsqueeze(0).expand(channel, 1, 1, 3, 3)
-        self.sobel_kernel_x_conv3d = nn.Conv3d(channel, channel, kernel_size=3, padding=1, groups=channel, bias=False)
-        self.sobel_kernel_y_conv3d = nn.Conv3d(channel, channel, kernel_size=3, padding=1, groups=channel, bias=False)
-        self.sobel_kernel_x_conv3d.weight.data = sobel_kernel_x.clone()
-        self.sobel_kernel_y_conv3d.weight.data = sobel_kernel_y.clone()
-        self.sobel_kernel_x_conv3d.requires_grad = False
-        self.sobel_kernel_y_conv3d.requires_grad = False
+        # 标准 Sobel 算子
+        sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+        sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+
+        self.conv_x = nn.Conv2d(channel, channel, kernel_size=3, padding=1, groups=channel, bias=False)
+        self.conv_y = nn.Conv2d(channel, channel, kernel_size=3, padding=1, groups=channel, bias=False)
+
+        # 重塑为 PyTorch 权重格式 (C, 1, 3, 3)
+        weight_x = torch.from_numpy(sobel_x).view(1, 1, 3, 3).repeat(channel, 1, 1, 1)
+        weight_y = torch.from_numpy(sobel_y).view(1, 1, 3, 3).repeat(channel, 1, 1, 1)
+
+        self.conv_x.weight.data = weight_x
+        self.conv_y.weight.data = weight_y
+        self.conv_x.weight.requires_grad = False
+        self.conv_y.weight.requires_grad = False
 
     def forward(self, x):
-        return (self.sobel_kernel_x_conv3d(x[:, :, None, :, :]) + self.sobel_kernel_y_conv3d(x[:, :, None, :, :]))[
-            :, :, 0]
-
+        # 取 x 和 y 方向的梯度之和
+        return self.conv_x(x) + self.conv_y(x)
 
 class EFE(nn.Module):
     def __init__(self, inc, ouc) -> None:
@@ -219,7 +199,7 @@ class EFE(nn.Module):
         self.conv_branch = Conv(inc, inc, 3)
         self.conv1 = Conv(inc * 2, inc, 1)
         self.conv2 = Conv(inc, ouc, 1)
-        self.drg = DynamicResidualGroup(conv=default_conv, n_feat=ouc, kernel_size=3, reduction=4, n_resblocks=2)
+        self.drg = DynamicResidualGroup(c1=ouc, c2=ouc, num_blocks=2)
 
     def forward(self, x):
         x_sobel = self.sobel_branch(x)
@@ -230,20 +210,17 @@ class EFE(nn.Module):
         x_drg = self.drg(x_fuse - x) + x
         return x_drg
 
-
 class C3k_EFE(C3k):
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, k=3):
         super().__init__(c1, c2, n, shortcut, g, e, k)
         c_ = int(c2 * e)
         self.m = nn.Sequential(*(EFE(c_, c_) for _ in range(n)))
 
-
 class C3k2_EFE(C3k2):
     def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
         super().__init__(c1, c2, n, c3k, e, g, shortcut)
         self.m = nn.ModuleList(
             C3k_EFE(self.c, self.c, 2, shortcut, g) if c3k else EFE(self.c, self.c) for _ in range(n))
-
 
 class SPDConv(nn.Module):
     def __init__(self, inc, ouc, dimension=1):
@@ -255,7 +232,6 @@ class SPDConv(nn.Module):
         x = torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1)
         x = self.conv(x)
         return x
-
 
 class FGM(nn.Module):
     def __init__(self, dim) -> None:
@@ -275,7 +251,6 @@ class FGM(nn.Module):
         out = torch.fft.ifft2(out, dim=(-2, -1), norm='backward')
         out = torch.abs(out)
         return out * self.alpha + x * self.beta
-
 
 class OmniKernel(nn.Module):
     def __init__(self, dim) -> None:
@@ -308,7 +283,6 @@ class OmniKernel(nn.Module):
         out = x + self.dw_13(out) + self.dw_31(out) + self.dw_33(out) + self.dw_11(out) + x_sca
         out = self.act(out)
         return self.out_conv(out)
-
 
 class Multibranch(nn.Module):
     def __init__(self, dim, e=0.25):
