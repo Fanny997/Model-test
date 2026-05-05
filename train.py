@@ -21,5 +21,5 @@ if __name__ == '__main__':
                 # resume=True,
                 amp=False, # close amp
                 project='runs/Newruns/M3FD/train',
-                name='DRG-DSA-ADSF-GCAI',
+                name='DRG-DSA-ADSF',
                 )

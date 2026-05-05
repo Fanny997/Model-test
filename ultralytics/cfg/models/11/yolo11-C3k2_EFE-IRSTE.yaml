@@ -37,11 +37,10 @@ head:
   # Upsample P3 -> P2
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 12
 
-  # === GCAI 融合 ===
+  # === ADSF 融合 ===
   # Low Input: 2 (Backbone的 P2层，C3k2_EFE 输出)
   # High Input: -1 (当前的深层上采样特征)
-  # 修正：这里 from 变成了 [2, -1]
-  - [[2, -1], 1, ADSF_Fusion, [256]] # 13 (GCAI 融合)
+  - [[2, -1], 1, ADSF_Fusion, [256]] # 13 (ADSF 融合)
 
   - [-1, 2, C3k2, [256, False]] # 14 (P2 融合后处理)
 
