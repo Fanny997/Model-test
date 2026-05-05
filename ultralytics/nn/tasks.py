@@ -12,10 +12,10 @@ import torch.nn as nn
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.extra_modules.block import (
-    MDTE_Conv,
     GCAI_Fusion,
+    ADSF_Fusion,
     DynamicResidualGroup,
-    C3k2_EFE,
+    MDTE_Conv,
 )
 from ultralytics.nn.modules import (
     AIFI,
@@ -1499,39 +1499,69 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m in {Multibranch}:
+            c2 = ch[f]
+            args = [c2]
 
-            # 解析单输入的自定义网络层
-
-        elif m in {DynamicResidualGroup, C3k2_EFE, MDTE_Conv}:
-
-            c1, c2 = ch[f], args[0]
-
-            # 【修复】：将 gw 替换为官方的 width
-
-            c2 = make_divisible(min(c2, max_channels) * width, 8)
-
-            args = [c1, c2, *args[1:]]
-
-
-        # 解析双输入的跨层级融合层 (核心)
+        # elif m is GCAI_Fusion:
+        #     c1 = [ch[x] for x in f]  # 获取来源层的通道数：ch[2] 和 ch[-1]
+        #     c2 = args[0]
+        #     c2 = make_divisible(min(c2, max_channels) * width, 8)  # 获取输出通道数：256
+        #     args = [c1[0], c1[1], c2]  # 重新组合参数传给 GCAI_Fusion 的 __init__
+        # elif m is DynamicResidualGroup:
+        #     # args[0] 是 YAML 里的 1024
+        #     # max_channels 和 width 是 parse_model 函数顶部的变量
+        #     # 这一步将 1024 * 0.25 = 256，保证和输入层匹配
+        #     c2 = args[0]
+        #     c2 = make_divisible(min(c2, max_channels) * width, 8)
+        #     args = [c2]  # 将缩放后的 256 传给 block.py 的 n_feat
+        # else:
+        #     c2 = ch[f]
+        # elif m is GCAI_Fusion:
+        #     # (这是你之前的代码，保持不变)
+        #     c1 = [ch[x] for x in f]
+        #     c2 = args[0]
+        #     args = [c1[0], c1[1], c2]
+        #
+        #     # ===【新增这段代码】===
+        # elif m is DynamicResidualGroup:
+        #     # args[0] 是 YAML 里的 1024
+        #     # max_channels 和 width 是 parse_model 函数顶部的变量
+        #     # 这一步将 1024 * 0.25 = 256，保证和输入层匹配
+        #     c2 = args[0]
+        #     c2 = make_divisible(min(c2, max_channels) * width, 8)
+        #     args = [c2]  # 将缩放后的 256 传给 block.py 的 n_feat
+        #     # ====================
+        # elif m is GCAI_Fusion:
+        #     c1 = [ch[x] for x in f]
+        #     # 增加缩放逻辑：将 YAML 里的 128 缩放为 32 (对应 n 模型)
+        #     c2 = args[0]
+        #     c2 = make_divisible(min(c2, max_channels) * width, 8)
+        #     args = [c1[0], c1[1], c2]
+        #
+        # elif m is DynamicResidualGroup:
+        #     c2 = args[0]
+        #     c2 = make_divisible(min(c2, max_channels) * width, 8)
+        #     args = [c2]
+        #
+        # elif m is MDTE_Simplified:  # <--- 新增这个模块的处理
+        #     c2 = args[0]
+        #     # 同样加上缩放逻辑，确保 256 变成 64
+        #     c2 = make_divisible(min(c2, max_channels) * width, 8)
+        #     args = [c2]
 
         elif m is GCAI_Fusion:
-
-            # GCAI_Fusion 接收: c_low, c_high, c_out
-
-            c1 = ch[f[0]]  # x_low (浅层特征通道数)
-
-            c_high = ch[f[1]]  # x_high (深层特征通道数)
-
-            c2 = args[0]  # c_out (输出通道数)
-
-            # 【修复】：将 gw 替换为官方的 width
-
+            c1 = [ch[x] for x in f]
+            # 增加缩放逻辑：将 YAML 里的配置缩放 (对应 n/s/m/l 不同模型)
+            c2 = args[0]
             c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1[0], c1[1], c2]
 
-            args = [c1, c_high, c2, *args[1:]]
-
-        # ==============================================================
+        elif m is ADSF_Fusion:
+            c1 = [ch[x] for x in f]  # 获取来源层(浅层和深层)的通道数
+            c2 = args[0]  # 获取 YAML 中配置的输出通道数
+            c2 = make_divisible(min(c2, max_channels) * width, 8)  # 根据模型大小(n/s/m)自适应缩放通道
+            args = [c1[0], c1[1], c2]
 
         elif m is DynamicResidualGroup:
             c2 = args[0]
