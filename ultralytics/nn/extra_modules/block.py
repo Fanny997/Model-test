@@ -114,32 +114,38 @@ class MDTE_Conv(nn.Module):
 class EFE(nn.Module):
     def __init__(self, inc, ouc) -> None:
         super().__init__()
-        # --- 改进: 用 MDTE (方向增强) 替换 Sobel (固定梯度) ---
-        # 理由：Sobel 对噪声敏感；MDTE 能通过多方向差分抑制杂波
-        self.edge_branch = MDTE_Conv(inc)
-        # -----------------------------------------------------
+        # 1. 主干语义分支
+        self.conv_main = Conv(inc, inc, 3)
 
-        self.conv_branch = Conv(inc, inc, 3)
-        self.conv1 = Conv(inc * 2, ouc, 1)
-        # DRG 模块保持不变，用于对融合后的特征进行深层语义精炼
+        # 2. 梯度/高频特征分支 (你的 MDTE)
+        self.edge_branch = MDTE_Conv(inc)
+
+        # 3. 掩码生成器 (将 MDTE 的特征压缩为 1 个通道的权重)
+        self.mask_generator = nn.Sequential(
+            nn.Conv2d(inc, 1, kernel_size=1),
+            nn.Sigmoid()  # 输出 0~1 的权重
+        )
+
+        self.conv_out = Conv(inc, ouc, 1)
         self.drg = DynamicResidualGroup(conv=default_conv, n_feat=ouc, kernel_size=3, reduction=4, n_resblocks=2)
 
     def forward(self, x):
-        # 1. 提取特征
-        x_edge = self.edge_branch(x)  # 这里的特征现在是“纯净的目标增强特征”
-        x_main = self.conv_branch(x)
+        # 1. 提取主干特征和边缘特征
+        x_main = self.conv_main(x)
+        x_edge = self.edge_branch(x)
 
-        # 2. 融合 (MDTE 提取的边缘特征 + 卷积提取的语义特征)
-        x_concat = torch.cat([x_main, x_edge], dim=1)
+        # 2. 【核心改造】：特征调制 (Feature Modulation)
+        # 利用 MDTE 生成空间注意力权重
+        edge_mask = self.mask_generator(x_edge)
 
-        # 3. 降维融合
-        x_fused = self.conv1(x_concat)
+        # 将权重乘回主干特征：只有梯度显著的地方（疑似目标），主干特征才会被保留
+        x_modulated = x_main * edge_mask
 
-        # 4. DRG 增强
-        # DRG 放在这里是为了进一步精炼融合后的特征
-        # 残差连接 x_fused 保证梯度传播
+        # 3. 残差连接：防止梯度消失，保留原始信息
+        x_fused = self.conv_out(x_modulated + x_main)
+
+        # 4. DRG 精炼
         out = self.drg(x_fused) + x_fused
-
         return out
 
 
