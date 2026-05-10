@@ -112,43 +112,45 @@ class MDTE_Conv(nn.Module):
 #    核心改动：移除了 SobelConv，替换为 MDTE_Conv
 # ================================================================
 class EFE(nn.Module):
+    """
+    改进版 EFE: 纯粹的边缘增强与门控融合模块 (移除 DRG)
+    设计理念：利用 MDTE 提取物理先验，通过门控掩码 (Gated Mask) 过滤主干特征中的杂波。
+    """
+
     def __init__(self, inc, ouc) -> None:
         super().__init__()
-        # 1. 主干语义分支
-        self.conv_main = Conv(inc, inc, 3)
 
-        # 2. 梯度/高频特征分支 (你的 MDTE)
+        # 1. 物理边缘先验分支
         self.edge_branch = MDTE_Conv(inc)
 
-        # 3. 掩码生成器 (将 MDTE 的特征压缩为 1 个通道的权重)
-        self.mask_generator = nn.Sequential(
-            nn.Conv2d(inc, 1, kernel_size=1),
-            nn.Sigmoid()  # 输出 0~1 的权重
+        # 2. 语义主干分支
+        self.main_branch = Conv(inc, inc, 3)
+
+        # 3. 创新点：注意力门控生成器 (Gated Fusion) 替代 Concat
+        # 利用通道自注意力生成 0~1 的软掩码，智能决定主干特征中哪些是背景，哪些是目标
+        self.gate_generator = nn.Sequential(
+            nn.Conv2d(inc * 2, inc, 1),
+            nn.BatchNorm2d(inc),
+            nn.Sigmoid()
         )
 
-        self.conv_out = Conv(inc, ouc, 1)
-        self.drg = DynamicResidualGroup(conv=default_conv, n_feat=ouc, kernel_size=3, reduction=4, n_resblocks=2)
+        # 4. 降维输出
+        self.out_conv = Conv(inc, ouc, 1)
 
     def forward(self, x):
-        # 1. 提取主干特征和边缘特征
-        x_main = self.conv_main(x)
+        # 提取主干与边缘特征
+        x_main = self.main_branch(x)
         x_edge = self.edge_branch(x)
 
-        # 2. 【核心改造】：特征调制 (Feature Modulation)
-        # 利用 MDTE 生成空间注意力权重
-        edge_mask = self.mask_generator(x_edge)
+        # 【核心突破】：门控融合机制 (Gated Mechanism)
+        # 将两者拼接后生成权重掩码 w
+        w = self.gate_generator(torch.cat([x_main, x_edge], dim=1))
 
-        # 将权重乘回主干特征：只有梯度显著的地方（疑似目标），主干特征才会被保留
-        x_modulated = x_main * edge_mask
+        # 使用掩码 w 对主干特征进行“软清洗”，同时加上边缘特征作为残差兜底
+        # 这样能100%防止 Concat 带来的特征污染
+        x_fused = x_main * w + x_edge * (1 - w)
 
-        # 3. 残差连接：防止梯度消失，保留原始信息
-        x_fused = self.conv_out(x_modulated + x_main)
-
-        # 4. DRG 精炼
-        out = self.drg(x_fused) + x_fused
-        return out
-
-
+        return self.out_conv(x_fused)
 # ================================================================
 # 4. 其他辅助模块 (保持不变或微调)
 # ================================================================
